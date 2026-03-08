@@ -2530,8 +2530,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
             # When FP8 weights are used without FP8 prefill, kv_b_proj expects
             # model dtype input and will quantize internally.
-            # For NVFP4, weights are packed uint8 — keep input in bf16 since
-            # the NVFP4 linear layer quantizes internally via scaled_fp4_quant.
+            # For NVFP4, weights are packed uint8 — keep input in model dtype
+            # since the NVFP4 linear layer quantizes internally.
             if (
                 use_fp8_prefill
                 or self.kv_b_proj.weight.dtype != current_platform.fp8_dtype()
