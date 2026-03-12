@@ -830,6 +830,16 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
 
         return quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
 
+    def forward_mha_supports_quant_output(self, quant_key: "QuantKey") -> bool:
+        """
+        Whether the forward_mha prefill kernel can produce quantized output
+        directly, avoiding a separate quant kernel after attention.
+
+        Subclasses override this when their kernel supports writing
+        FP8/NVFP4/per-group-FP8 in the epilogue.
+        """
+        return False
+
     def do_kv_cache_update(
         self,
         kv_c_normed: torch.Tensor,

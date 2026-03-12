@@ -559,8 +559,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
-        use_quant = output_scale is not None or output_block_scale is not None
-        if use_quant:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kFp8StaticTensorSym,
+            kNvfp4Dynamic,
+        )
+
+        quant_key = None
+        if output_block_scale is not None:
+            quant_key = kNvfp4Dynamic
+        elif output_scale is not None:
+            quant_key = kFp8StaticTensorSym
+
+        if quant_key:
             # The fusion pass has allocated output with quantized dtype
             # (FP8 or uint8 for FP4). We can't write BF16 into it directly,
             # so we swap in a temp BF16 buffer for computation, then quantize
@@ -586,7 +596,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
             # same expert outputs.
-            if use_quant:
+            if quant_key:
                 return quant_output.fill_(0)
             return output.fill_(0)
 
@@ -622,19 +632,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
-        # Check if the prefill kernel can produce FP8 directly.
-        # Only applies to static FP8 (not NVFP4) and when kernel supports it.
-        mha_native_fp8 = (
-            use_quant
-            and output_block_scale is None
-            and num_mha_tokens > 0
-            and self.impl._supports_native_fp8_output
+        # Check if the prefill kernel can produce quantized output directly.
+        mha_native_quant = quant_key and self.impl.forward_mha_supports_quant_output(
+            quant_key
         )
 
         if num_mha_tokens > 0:
-            if mha_native_fp8:
-                # Pass the quant output buffer directly — the kernel will
-                # write FP8 into it, skipping the bf16 intermediate.
+            if mha_native_quant:
                 self.impl.forward_mha(
                     q[num_mqa_tokens:],
                     k_c_normed[num_mqa_tokens:],
@@ -751,34 +755,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
 
-        if use_quant:
-            if mha_native_fp8 and num_mqa_tokens == 0:
-                # All tokens were prefill and the kernel wrote FP8 directly
-                # into quant_output — no software quant needed.
-                return quant_output
+        if not quant_key:
+            return output_padded
 
-            # Quantize the BF16 computation result into the quantized output.
-            # When mha_native_fp8 is True, the MHA (prefill) portion was
-            # already written into quant_output by the kernel, so only
-            # quantize the MQA (decode) portion here.
-            if mha_native_fp8:
-                actual = output[:num_mqa_tokens]
-                quant_slice = quant_output[:num_mqa_tokens]
-            else:
-                actual = output[:num_actual_toks]
-                quant_slice = quant_output[:num_actual_toks]
-
-            if output_block_scale is not None:
-                # NVFP4: two FP4 values packed into one uint8
-                fp4_data, fp4_scales = ops.scaled_fp4_quant(actual, output_scale)
-                quant_slice.copy_(fp4_data)
-                output_block_scale.copy_(fp4_scales)
-            else:
-                # Static FP8 quantization
-                torch.ops._C.static_scaled_fp8_quant(quant_slice, actual, output_scale)
+        # index [0:quant_offset] needs quant
+        offset = num_mqa_tokens if mha_native_quant else num_actual_toks
+        if offset == 0:
             return quant_output
 
-        return output_padded
+        if quant_key == kNvfp4Dynamic:
+            # NVFP4: two FP4 values packed into one uint8
+            fp4_data, fp4_scales = ops.scaled_fp4_quant(output[:offset], output_scale)
+            quant_output[:offset].copy_(fp4_data)
+            assert output_block_scale is not None
+            output_block_scale.copy_(fp4_scales)
+        else:
+            torch.ops._C.static_scaled_fp8_quant(
+                quant_output[:offset], output[:offset], output_scale
+            )
+
+        return quant_output
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # we currently do not have quantized bmm's which are needed for
@@ -2132,6 +2128,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         return quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
 
+    def forward_mha_supports_quant_output(self, quant_key) -> bool:
+        return quant_key in self._forward_mha_quant_output_keys
+
     def __init__(
         self,
         num_heads: int,
@@ -2185,9 +2184,16 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             and (self.qk_rope_head_dim == 64)
         )
 
-        # Track whether the prefill kernel can produce FP8 output natively
-        # (avoiding a separate bf16→FP8 quant kernel).
-        self._supports_native_fp8_output = False
+        # Quant keys for which the prefill kernel (forward_mha) can produce
+        # quantized output directly, avoiding a separate quant kernel.
+        # Populated per-backend; extended as backends gain support for more
+        # quant types (per-group FP8, NVFP4, etc.).
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            QuantKey,
+            kFp8StaticTensorSym,
+        )
+
+        self._forward_mha_quant_output_keys: set[QuantKey] = set()
 
         if use_trtllm_ragged_deepseek_prefill():
             logger.info_once(
@@ -2198,7 +2204,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             )
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_trtllm_ragged
             self._pad_v = False
-            self._supports_native_fp8_output = True
+            self._forward_mha_quant_output_keys.add(kFp8StaticTensorSym)
         elif use_flashinfer_prefill():
             logger.info_once("Using FlashInfer prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fi
@@ -2439,14 +2445,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert prefill.query_seq_lens is not None
         assert prefill.workspace_buffer is not None
 
-        # When output_scale is provided, produce FP8 output directly.
-        # The kernel handles quantization in its epilogue, avoiding a
-        # separate bf16 round-trip through HBM.
         if output_scale is not None:
             out_dtype = current_platform.fp8_dtype()
-            # bmm2_scale encodes the output quantization scale:
-            # the kernel multiplies the attention output by bmm2_scale
-            # before writing, so 1/scale converts bf16 range to fp8.
             bmm2_scale = 1.0 / output_scale.item()
         else:
             out_dtype = prefill.output_dtype
@@ -2785,17 +2785,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         has_context = prefill_metadata.chunked_context is not None
 
-        # Only pass output_scale to kernels that support native FP8 output.
-        # For has_context=True, we need bf16 intermediates for merge_attn_states
-        # so native FP8 output is not applicable.
-        kernel_output_scale = (
-            output_scale
-            if output_scale is not None
-            and not has_context
-            and self._supports_native_fp8_output
-            else None
-        )
-
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
@@ -2813,8 +2802,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             v=v,
             return_softmax_lse=has_context,
         )
-        if kernel_output_scale is not None:
-            prefill_kwargs["output_scale"] = kernel_output_scale
+        if output_scale is not None and not has_context:
+            prefill_kwargs["output_scale"] = output_scale
 
         output_prefill = self._run_prefill_new_tokens(**prefill_kwargs)
 
