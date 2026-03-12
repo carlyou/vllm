@@ -622,16 +622,39 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
+        # Check if the prefill kernel can produce FP8 directly.
+        # Only applies to static FP8 (not NVFP4) and when kernel supports it.
+        mha_native_fp8 = (
+            use_quant
+            and output_block_scale is None
+            and num_mha_tokens > 0
+            and self.impl._supports_native_fp8_output
+        )
+
         if num_mha_tokens > 0:
-            self.impl.forward_mha(
-                q[num_mqa_tokens:],
-                k_c_normed[num_mqa_tokens:],
-                k_pe[num_mqa_tokens:],
-                kv_cache,
-                attn_metadata,
-                self._k_scale,
-                output=output[num_mqa_tokens:],
-            )
+            if mha_native_fp8:
+                # Pass the quant output buffer directly — the kernel will
+                # write FP8 into it, skipping the bf16 intermediate.
+                self.impl.forward_mha(
+                    q[num_mqa_tokens:],
+                    k_c_normed[num_mqa_tokens:],
+                    k_pe[num_mqa_tokens:],
+                    kv_cache,
+                    attn_metadata,
+                    self._k_scale,
+                    output=quant_output[num_mqa_tokens:num_actual_toks],
+                    output_scale=output_scale,
+                )
+            else:
+                self.impl.forward_mha(
+                    q[num_mqa_tokens:],
+                    k_c_normed[num_mqa_tokens:],
+                    k_pe[num_mqa_tokens:],
+                    kv_cache,
+                    attn_metadata,
+                    self._k_scale,
+                    output=output[num_mqa_tokens:],
+                )
 
         if num_mqa_tokens > 0:
             mqa_q = q[:num_mqa_tokens]
@@ -729,17 +752,30 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if use_quant:
-            # Quantize the BF16 computation result into the quantized output
-            actual = output[:num_actual_toks]
+            if mha_native_fp8 and num_mqa_tokens == 0:
+                # All tokens were prefill and the kernel wrote FP8 directly
+                # into quant_output — no software quant needed.
+                return quant_output
+
+            # Quantize the BF16 computation result into the quantized output.
+            # When mha_native_fp8 is True, the MHA (prefill) portion was
+            # already written into quant_output by the kernel, so only
+            # quantize the MQA (decode) portion here.
+            if mha_native_fp8:
+                actual = output[:num_mqa_tokens]
+                quant_slice = quant_output[:num_mqa_tokens]
+            else:
+                actual = output[:num_actual_toks]
+                quant_slice = quant_output[:num_actual_toks]
+
             if output_block_scale is not None:
                 # NVFP4: two FP4 values packed into one uint8
                 fp4_data, fp4_scales = ops.scaled_fp4_quant(actual, output_scale)
-                quant_output[:num_actual_toks].copy_(fp4_data)
+                quant_slice.copy_(fp4_data)
                 output_block_scale.copy_(fp4_scales)
             else:
                 # Static FP8 quantization
-                quant_actual = quant_output[:num_actual_toks]
-                torch.ops._C.static_scaled_fp8_quant(quant_actual, actual, output_scale)
+                torch.ops._C.static_scaled_fp8_quant(quant_slice, actual, output_scale)
             return quant_output
 
         return output_padded
@@ -2149,6 +2185,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             and (self.qk_rope_head_dim == 64)
         )
 
+        # Track whether the prefill kernel can produce FP8 output natively
+        # (avoiding a separate bf16→FP8 quant kernel).
+        self._supports_native_fp8_output = False
+
         if use_trtllm_ragged_deepseek_prefill():
             logger.info_once(
                 "Using TRT-LLM ragged DeepSeek prefill for MLA", scope="local"
@@ -2158,6 +2198,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             )
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_trtllm_ragged
             self._pad_v = False
+            self._supports_native_fp8_output = True
         elif use_flashinfer_prefill():
             logger.info_once("Using FlashInfer prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fi
@@ -2247,7 +2288,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         return attn_out
 
     def _run_prefill_new_tokens_fa(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        output_scale: torch.Tensor | None = None,
     ):
         return self._flash_attn_varlen_diff_headdims(
             q=q,
@@ -2263,7 +2310,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
     def _run_prefill_new_tokens_fi(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        output_scale: torch.Tensor | None = None,
     ):
         assert isinstance(prefill, FlashInferPrefillMetadata)
         assert prefill.prefill_main is not None
@@ -2280,7 +2333,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         return ret
 
     def _run_prefill_new_tokens_cudnn(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        output_scale: torch.Tensor | None = None,
     ):
         assert isinstance(prefill, CudnnPrefillMetadata)
         assert prefill.query_seq_lens is not None
@@ -2366,20 +2425,39 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
     def _run_prefill_new_tokens_trtllm_ragged(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        output_scale: torch.Tensor | None = None,
     ):
         """TRT-LLM ragged attention for new tokens (causal)."""
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
         assert prefill.query_seq_lens is not None
         assert prefill.workspace_buffer is not None
-        # allocate BF16 / FP16 output tensor for TRT-LLM ragged attention
+
+        # When output_scale is provided, produce FP8 output directly.
+        # The kernel handles quantization in its epilogue, avoiding a
+        # separate bf16 round-trip through HBM.
+        if output_scale is not None:
+            out_dtype = current_platform.fp8_dtype()
+            # bmm2_scale encodes the output quantization scale:
+            # the kernel multiplies the attention output by bmm2_scale
+            # before writing, so 1/scale converts bf16 range to fp8.
+            bmm2_scale = 1.0 / output_scale.item()
+        else:
+            out_dtype = prefill.output_dtype
+            bmm2_scale = 1.0
+
         out = torch.empty(
             q.shape[0],
             q.shape[1],
             v.shape[2],
             device=q.device,
-            dtype=prefill.output_dtype,
+            dtype=out_dtype,
         )
 
         ret = trtllm_ragged_attention_deepseek(
@@ -2391,7 +2469,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             max_q_len=prefill.max_query_len,
             max_kv_len=prefill.max_query_len,
             bmm1_scale=self.scale,
-            bmm2_scale=1.0,
+            bmm2_scale=bmm2_scale,
             o_sf_scale=1.0,
             batch_size=prefill.query_seq_lens.shape[0],
             window_left=-1,
@@ -2692,6 +2770,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         attn_metadata: MLACommonMetadata,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
     ) -> None:
         # TODO (zyongye): Prefill function here
         assert attn_metadata.prefill is not None
@@ -2706,6 +2785,17 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         has_context = prefill_metadata.chunked_context is not None
 
+        # Only pass output_scale to kernels that support native FP8 output.
+        # For has_context=True, we need bf16 intermediates for merge_attn_states
+        # so native FP8 output is not applicable.
+        kernel_output_scale = (
+            output_scale
+            if output_scale is not None
+            and not has_context
+            and self._supports_native_fp8_output
+            else None
+        )
+
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
@@ -2716,13 +2806,17 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             k = k.to(prefill_metadata.q_data_type)
             v = v.to(prefill_metadata.q_data_type)
 
-        output_prefill = self._run_prefill_new_tokens(
+        prefill_kwargs: dict = dict(
             prefill=prefill_metadata,
             q=q,
             k=k,
             v=v,
             return_softmax_lse=has_context,
         )
+        if kernel_output_scale is not None:
+            prefill_kwargs["output_scale"] = kernel_output_scale
+
+        output_prefill = self._run_prefill_new_tokens(**prefill_kwargs)
 
         if has_context:
             suffix_output, suffix_lse = output_prefill
