@@ -235,7 +235,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
+    QuantKey,
     get_and_maybe_dequant_weights,
+    kFp8StaticTensorSym,
+    kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer, has_nvidia_artifactory
@@ -558,11 +561,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
-
-        from vllm.model_executor.layers.quantization.utils.quant_utils import (
-            kFp8StaticTensorSym,
-            kNvfp4Dynamic,
-        )
 
         quant_key = None
         if output_block_scale is not None:
@@ -1687,6 +1685,27 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         kv_indptr = qo_indptr.clone()
 
         # Prepare main prefill
+        # Determine output dtype for FlashInfer plan.
+        # The fusion pass sets _forward_mha_output_dtype on the impl when
+        # it fuses quantization (e.g., FP8 static) onto attention. We use
+        # it here so plan() selects the matching kernel epilogue.
+        #
+        # Only plan with FP8 when there is no context: when has_context,
+        # the main prefill returns (output, lse) for merge_attn_states
+        # and must produce bf16. FlashInfer's ragged run() ignores
+        # _cached_o_data_type when out=None (allocates bf16), so planning
+        # FP8 without providing an FP8 out buffer causes dtype mismatch.
+        fi_o_data_type = prefill.output_dtype
+        if not has_context:
+            for ctx in self.compilation_config.static_forward_context.values():
+                fwd_dtype = getattr(
+                    getattr(ctx, "impl", None),
+                    "_forward_mha_output_dtype",
+                    None,
+                )
+                if fwd_dtype is not None:
+                    fi_o_data_type = fwd_dtype
+                    break
         self._fi_prefill_main.plan(
             qo_indptr=qo_indptr,
             kv_indptr=kv_indptr,
@@ -1699,7 +1718,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             window_left=self._global_hyperparameters.window_left,
             logits_soft_cap=self._global_hyperparameters.logits_soft_cap,
             q_data_type=self.q_data_type,
-            o_data_type=prefill.output_dtype,
+            o_data_type=fi_o_data_type,
         )
 
         # Prepare context prefills
@@ -2121,11 +2140,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
     """
 
     def fused_output_quant_supported(self, quant_key):
-        from vllm.model_executor.layers.quantization.utils.quant_utils import (
-            kFp8StaticTensorSym,
-            kNvfp4Dynamic,
-        )
-
         return quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
 
     def forward_mha_supports_quant_output(self, quant_key) -> bool:
@@ -2188,12 +2202,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         # quantized output directly, avoiding a separate quant kernel.
         # Populated per-backend; extended as backends gain support for more
         # quant types (per-group FP8, NVFP4, etc.).
-        from vllm.model_executor.layers.quantization.utils.quant_utils import (
-            QuantKey,
-            kFp8StaticTensorSym,
-        )
-
         self._forward_mha_quant_output_keys: set[QuantKey] = set()
+
+        # Output dtype for forward_mha prefill kernel, set by the fusion
+        # pass when it fuses quantization onto attention (e.g., FP8 static).
+        # Used by FlashInfer's plan() to select the correct output kernel.
+        # None means use the default (model dtype, typically bf16).
+        self._forward_mha_output_dtype: torch.dtype | None = None
 
         if use_trtllm_ragged_deepseek_prefill():
             logger.info_once(
@@ -2210,6 +2225,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fi
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_fi
             self._pad_v = False
+            self._forward_mha_quant_output_keys.add(kFp8StaticTensorSym)
         elif use_cudnn_prefill():
             logger.info_once("Using CUDNN prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_cudnn
@@ -2301,6 +2317,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         v,
         return_softmax_lse,
         output_scale: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ):
         return self._flash_attn_varlen_diff_headdims(
             q=q,
@@ -2323,16 +2340,20 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         v,
         return_softmax_lse,
         output_scale: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ):
         assert isinstance(prefill, FlashInferPrefillMetadata)
         assert prefill.prefill_main is not None
 
-        ret = prefill.prefill_main.run(
-            q=q,
-            k=k,
-            v=v,
-            return_lse=return_softmax_lse,
-        )
+        run_kwargs: dict = dict(q=q, k=k, v=v, return_lse=return_softmax_lse)
+
+        if output_scale is not None and output is not None:
+            # Reshape caller's FP8 output buffer from (T, N*D) to (T, N, D)
+            # and pass directly to FlashInfer to avoid an extra allocation+copy.
+            run_kwargs["out"] = output.view(q.shape[0], q.shape[1], v.shape[2])
+            run_kwargs["o_scale"] = 1.0 / output_scale.item()
+
+        ret = prefill.prefill_main.run(**run_kwargs)
 
         if isinstance(ret, tuple):
             return ret[0], ret[1].transpose(0, 1).contiguous()
@@ -2346,6 +2367,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         v,
         return_softmax_lse,
         output_scale: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ):
         assert isinstance(prefill, CudnnPrefillMetadata)
         assert prefill.query_seq_lens is not None
@@ -2438,6 +2460,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         v,
         return_softmax_lse,
         output_scale: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ):
         """TRT-LLM ragged attention for new tokens (causal)."""
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
@@ -2446,19 +2469,27 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert prefill.workspace_buffer is not None
 
         if output_scale is not None:
-            out_dtype = current_platform.fp8_dtype()
             bmm2_scale = 1.0 / output_scale.item()
+            if output is not None:
+                # Reuse caller's FP8 buffer directly
+                out = output.view(q.shape[0], q.shape[1], v.shape[2])
+            else:
+                out = torch.empty(
+                    q.shape[0],
+                    q.shape[1],
+                    v.shape[2],
+                    device=q.device,
+                    dtype=current_platform.fp8_dtype(),
+                )
         else:
-            out_dtype = prefill.output_dtype
             bmm2_scale = 1.0
-
-        out = torch.empty(
-            q.shape[0],
-            q.shape[1],
-            v.shape[2],
-            device=q.device,
-            dtype=out_dtype,
-        )
+            out = torch.empty(
+                q.shape[0],
+                q.shape[1],
+                v.shape[2],
+                device=q.device,
+                dtype=prefill.output_dtype,
+            )
 
         ret = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2802,8 +2833,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             v=v,
             return_softmax_lse=has_context,
         )
-        if output_scale is not None and not has_context:
+        native_quant = output_scale is not None and not has_context
+        if native_quant:
             prefill_kwargs["output_scale"] = output_scale
+            prefill_kwargs["output"] = output
 
         output_prefill = self._run_prefill_new_tokens(**prefill_kwargs)
 
@@ -2837,7 +2870,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 suffix_output=suffix_output,
                 suffix_lse=suffix_lse,
             )
-        else:
+        elif not native_quant:
+            # Native quant backends write directly into the output buffer,
+            # so skip the copy. Non-quant path still needs it.
             output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
             output.copy_(output_prefill)
 

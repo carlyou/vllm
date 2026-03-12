@@ -455,6 +455,21 @@ def test_mla_attention_quant_pattern(
 
     assert attn_pass.pass_.matched_count == sum(attn_fusion_supported)
 
+    # Check that the fusion pass propagated the output dtype to impls.
+    # FP8 static fusion should set _forward_mha_output_dtype = FP8_DTYPE.
+    # NVFP4 fusion should leave it as None (no native kernel support yet).
+    for layer in vllm_config.compilation_config.static_forward_context.values():
+        if not isinstance(layer, MLAAttention):
+            continue
+        if quant_key.dtype == FP8_DTYPE and "-quant_fp8" not in custom_ops_list:
+            assert layer.impl._forward_mha_output_dtype == FP8_DTYPE, (
+                "FP8 fusion should set _forward_mha_output_dtype on impl"
+            )
+        elif quant_key.dtype == FP4_DTYPE:
+            assert layer.impl._forward_mha_output_dtype is None, (
+                "NVFP4 fusion should not set _forward_mha_output_dtype"
+            )
+
     # Check MLA attention ops in the graph
     attn_nodes_pre = list(find_op_nodes(MLA_ATTN_OP, test_backend.graph_pre_pass))
     attn_nodes_post = list(find_op_nodes(MLA_ATTN_OP, test_backend.graph_post_pass))

@@ -327,8 +327,8 @@ class MLAAttnFusionPass(VllmPatternMatcherPass):
 
         self.patterns = PatternMatcherPass(pass_name="mla_attn_fusion_pass")
 
-        mla_layers = get_layers_from_vllm_config(config, MLAAttention)
-        for layer_name, layer in mla_layers.items():
+        self.mla_layers = get_layers_from_vllm_config(config, MLAAttention)
+        for layer_name, layer in self.mla_layers.items():
             pattern_fp8 = MLAAttentionFp8StaticQuantPattern(
                 layer, config.model_config.dtype
             )
@@ -340,7 +340,7 @@ class MLAAttnFusionPass(VllmPatternMatcherPass):
                 )
                 pattern_nvfp4.register_if_supported(self.patterns)
 
-        if len(mla_layers) == 0:
+        if len(self.mla_layers) == 0:
             logger.warning(
                 "MLA attention + quant fusion is enabled, but no MLA "
                 "attention layers were found in "
@@ -354,6 +354,38 @@ class MLAAttnFusionPass(VllmPatternMatcherPass):
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         self.matched_count = self.patterns.apply(graph)
         logger.debug("Fused quant onto %s MLA attention nodes", self.matched_count)
+
+        if self.matched_count > 0:
+            self._propagate_fused_output_dtypes(graph)
+
+    def _propagate_fused_output_dtypes(self, graph: torch.fx.graph.Graph) -> None:
+        """Set the fused output dtype on attention impls after matching.
+
+        Backends with plan/run separation (e.g., FlashInfer) need to know
+        the output dtype at plan time. The fusion pass is the source of
+        truth for which layers have fused quantization and of which type.
+        """
+        for node in graph.nodes:
+            if not is_func(node, auto_functionalized):
+                continue
+            if not node.args or node.args[0] != MLA_ATTN_OP:
+                continue
+
+            output_scale = node.kwargs.get("output_scale")
+            output_block_scale = node.kwargs.get("output_block_scale")
+            layer_name = node.kwargs.get("layer_name")
+
+            # FP8 static fusion: output_scale is set, no block scale.
+            # NVFP4 fusion has both output_scale and output_block_scale,
+            # but no kernel supports native NVFP4 output yet.
+            if (
+                output_scale is not None
+                and output_block_scale is None
+                and layer_name in self.mla_layers
+            ):
+                layer = self.mla_layers[layer_name]
+                layer.impl._forward_mha_output_dtype = FP8_DTYPE
+                logger.debug("Set FP8 output dtype on layer %s", layer_name)
 
     def uuid(self) -> str:
         return VllmInductorPass.hash_source(
