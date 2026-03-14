@@ -121,7 +121,7 @@ class PassConfig:
     fuse_act_quant: bool = Field(default=None)
     """Fuse the custom SiluMul + quant ops."""
     fuse_attn_quant: bool = Field(default=None)
-    """Fuse the custom attention + quant ops."""
+    """Fuse the custom Attention and MLAAttention + quant ops."""
     eliminate_noops: bool = Field(default=True)
     """Eliminate no-op ops."""
     enable_sp: bool = Field(default=None)
