@@ -75,13 +75,16 @@ class MLAAttentionQuantPatternModel(torch.nn.Module):
         self.device = device
         self.vllm_config = vllm_config
 
-        # Create kv_b_proj (ColumnParallelLinear) on device
+        # Create kv_b_proj (ColumnParallelLinear) on device.
+        # Explicitly zero-fill weights because ColumnParallelLinear may
+        # produce NaN weights under certain torch.compile global states.
         kv_b_proj = ColumnParallelLinear(
             input_size=kv_lora_rank,
             output_size=num_heads * (qk_nope_head_dim + v_head_dim),
             bias=False,
             prefix="model.layers.0.self_attn.kv_b_proj",
         ).to(device)
+        kv_b_proj.weight.data.zero_()
 
         # Create MLAAttention
         self.mla_attn = MLAAttention(
@@ -157,7 +160,7 @@ class MLAAttentionQuantPatternModel(torch.nn.Module):
         )
         kv_cache = raw_tensor.permute(*inv_order)
 
-        self.mla_attn.kv_cache = [kv_cache]
+        self.mla_attn.kv_cache = kv_cache
 
         self.attn_metadata = self.builder.build(
             common_prefix_len=0, common_attn_metadata=common_attn_metadata
