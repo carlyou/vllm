@@ -18,6 +18,7 @@ from .common import (
 from .models import (
     FLASHINFER_ATTN,
     FLASHINFER_MLA_ATTN,
+    FLASHMLA_SPARSE_ATTN,
     TRITON_ATTN,
     TRITON_MLA_ATTN,
     deepseek_v3_fp8,
@@ -110,7 +111,7 @@ def test_tp2_ar_rms_fp8_fusions(
 )
 @pytest.mark.parametrize(
     "attn_backend",
-    [FLASHINFER_ATTN, FLASHINFER_MLA_ATTN, TRITON_MLA_ATTN],
+    [FLASHINFER_ATTN, FLASHINFER_MLA_ATTN, FLASHMLA_SPARSE_ATTN, TRITON_MLA_ATTN],
 )
 @pytest.mark.parametrize("n_layers", [4])
 @pytest.mark.parametrize("custom_ops", custom_ops_combos("rms_norm"))
