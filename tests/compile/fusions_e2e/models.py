@@ -183,7 +183,7 @@ deepseek_v3_fp8 = ModelFusionInfo(
 )
 
 deepseek_r1_fp4 = ModelFusionInfo(
-    model_name="nvidia/DeepSeek-R1-NVFP4",
+    model_name="nvidia/DeepSeek-R1-0528-NVFP4-v2",
     matches=lambda n_layers: Matches(
         rms_quant_fusion=0,
         act_quant_fusion=min(3, n_layers),
