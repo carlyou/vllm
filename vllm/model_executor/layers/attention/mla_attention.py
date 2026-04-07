@@ -305,7 +305,9 @@ def _detect_output_quant_key(
         return None
     if output_block_scale is not None:
         if output.dtype == _FP8_DTYPE:
-            # Per-group FP8 — infer group size from scale shape
+            # Per-group FP8 uses block scales only, not a separate output_scale
+            assert output_scale is None
+            # Infer group size from scale shape
             num_groups = output_block_scale.shape[-1]
             group_size = output_dim // num_groups
             if group_size == 128:

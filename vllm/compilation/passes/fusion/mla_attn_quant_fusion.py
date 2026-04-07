@@ -314,6 +314,22 @@ class MLAAttnFp8GroupQuantPattern(
 
         return _pattern
 
+    def extra_check(self, match) -> bool:
+        """Set group quant config on the layer when this pattern matches.
+        Done here (not in __init__) because all flag combinations
+        are registered per layer — only the matched one should win."""
+        from vllm.model_executor.layers.attention.mla_attention import (
+            _GroupQuantConfig,
+        )
+
+        self._layer._group_quant_config = _GroupQuantConfig(
+            group_size=self._group_size,
+            col_major=self._has_col_major_scales,
+            use_ue8m0=self._is_e8m0,
+            tma_aligned=self._is_tma_aligned,
+        )
+        return True
+
     @property
     def replacement(
         self,
@@ -326,40 +342,15 @@ class MLAAttnFp8GroupQuantPattern(
             kv_cache_dummy_dep: torch.Tensor,
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            # Set config on the layer now that this pattern matched.
-            # Done here (not in __init__) because all flag combinations
-            # are registered per layer — only the matched one should win.
-            from vllm.model_executor.layers.attention.mla_attention import (
-                _GroupQuantConfig,
-            )
-
-            self._layer._group_quant_config = _GroupQuantConfig(
-                group_size=self._group_size,
-                col_major=self._has_col_major_scales,
-                use_ue8m0=self._is_e8m0,
-                tma_aligned=self._is_tma_aligned,
-            )
-
             # MLA output in FP8
             output_attn = torch.empty(
                 [q.shape[0], self._output_dim],
                 dtype=FP8_DTYPE,
                 device=q.device,
             )
-            # Group scales buffer
-            num_groups = self._output_dim // self._group_size
-            if self._has_col_major_scales:
-                output_block_scale = torch.empty(
-                    [num_groups, q.shape[0]],
-                    dtype=torch.float32,
-                    device=q.device,
-                ).permute(1, 0)
-            else:
-                output_block_scale = torch.empty(
-                    [q.shape[0], num_groups],
-                    dtype=torch.float32,
-                    device=q.device,
-                )
+            # Reuse the matched pattern's scale buffer directly.
+            # This preserves whatever strides the original allocation
+            # had (including TMA-aligned strides if applicable).
             at1 = auto_functionalized(
                 MLA_ATTN_OP,
                 q=q,
@@ -368,7 +359,7 @@ class MLAAttnFp8GroupQuantPattern(
                 output=output_attn,
                 layer_name=self._layer_name,
                 output_scale=None,
-                output_block_scale=output_block_scale,
+                output_block_scale=scale,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
             return at1[1], at1[2]

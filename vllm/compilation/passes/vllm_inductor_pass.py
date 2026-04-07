@@ -224,6 +224,12 @@ class VllmPatternReplacement(ABC, Generic[P, R]):
         """Example tensors used to trace pattern and replacement."""
         ...
 
+    def extra_check(self, match: "pm.Match") -> bool:
+        """Optional extra check run on each match with real shapes.
+        Return True to accept the match (default), False to reject it.
+        May also perform side effects (e.g. setting layer config)."""
+        return True
+
     # Helpers for get_inputs: uninitialized tensors of common dtypes.
     @staticmethod
     def empty(*args, **kwargs) -> torch.Tensor:
@@ -283,6 +289,7 @@ class VllmFusionPatternMatcherPass(VllmPatternMatcherPass):
             pr.get_inputs(),
             self._trace_fn,
             self.pm_pass,
+            extra_check=pr.extra_check,
         )
         self._pattern_replacements.append(pr)
 
