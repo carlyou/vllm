@@ -173,9 +173,8 @@ deepseek_v3_fp8 = ModelFusionInfo(
         rms_quant_fusion=n_layers * 2 + min(3, n_layers),  # add for 3 dense layers
         # silu+block quant
         act_quant_fusion=min(3, n_layers),  # dense layers only
-        # MLA attn + per-group FP8 quant not supported yet:
-        # https://github.com/vllm-project/vllm/issues/35792
-        attn_quant_fusion=0,
+        # MLA attn + per-group FP8 quant
+        attn_quant_fusion=n_layers,
         ar_rms_fusion=n_layers * 2 + 1,
         # TODO
         # sequence_parallel= n_layers * 2 + 1,
@@ -183,11 +182,11 @@ deepseek_v3_fp8 = ModelFusionInfo(
     ),
 )
 
-deepseek_v32_fp4 = ModelFusionInfo(
-    model_name="nvidia/DeepSeek-V3.2-NVFP4",
+deepseek_r1_fp4 = ModelFusionInfo(
+    model_name="nvidia/DeepSeek-R1-0528-NVFP4-v2",
     matches=lambda n_layers: Matches(
         rms_quant_fusion=0,
-        act_quant_fusion=0,
+        act_quant_fusion=min(3, n_layers),
         attn_quant_fusion=n_layers,
         ar_rms_fusion=n_layers * 2 + 1,
     ),

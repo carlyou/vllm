@@ -108,6 +108,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer=self.indexer,
         )
 
+        # Pass o_proj's block FP8 op and weight to mla_attn for fused
+        # output quantization (must survive compile cache hits).
+        # TODO(carlyou): this needs to be refactored
+        if hasattr(self.o_proj, "quant_method") and hasattr(
+            self.o_proj.quant_method, "w8a8_block_fp8_linear"
+        ):
+            self.mla_attn._block_fp8_op = self.o_proj.quant_method.w8a8_block_fp8_linear
+            self.mla_attn.o_proj_weight = self.o_proj.weight
+
         self.prefix = prefix
 
     def forward(

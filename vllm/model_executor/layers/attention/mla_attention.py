@@ -234,9 +234,15 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
+    QuantKey,
     get_and_maybe_dequant_weights,
+    kFp8Dynamic64Sym,
+    kFp8Dynamic128Sym,
+    kFp8StaticTensorSym,
+    kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import should_use_deepgemm_for_fp8_linear
 from vllm.utils.flashinfer import has_flashinfer, has_nvidia_artifactory
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.torch_utils import (
@@ -275,6 +281,44 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+_FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def _detect_output_quant_key(
+    output: torch.Tensor,
+    output_scale: torch.Tensor | None,
+    output_block_scale: torch.Tensor | None,
+    output_dim: int,
+) -> QuantKey | None:
+    """Detect the output quantization key from fusion pass parameters.
+
+    Returns the appropriate QuantKey, or None if no quantization is needed.
+    Detection is based on output dtype and which scale tensors are present.
+    """
+    if output_scale is None and output_block_scale is None:
+        return None
+    if output_block_scale is not None:
+        if output.dtype == _FP8_DTYPE:
+            # Per-group FP8 uses block scales only, not a separate output_scale
+            assert output_scale is None
+            # Infer group size from scale shape
+            num_groups = output_block_scale.shape[-1]
+            group_size = output_dim // num_groups
+            if group_size == 128:
+                return kFp8Dynamic128Sym
+            elif group_size == 64:
+                return kFp8Dynamic64Sym
+            else:
+                raise ValueError(
+                    f"Unsupported group FP8 group_size={group_size} "
+                    f"(output_dim={output_dim}, num_groups={num_groups}). "
+                    f"Only group_size 128 and 64 are supported."
+                )
+        # output_scale None implies MXFP4, not supported
+        assert output_scale is not None
+        return kNvfp4Dynamic
+    return kFp8StaticTensorSym
 
 
 class MLAAttention(nn.Module, AttentionLayerBase):
@@ -457,6 +501,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             group_shape=GroupShape.PER_TENSOR,
             compile_native=True,
         )
+        # Per-group FP8 quant op for fused MLA attention output quantization.
+        # Set by MultiHeadLatentAttentionWrapper from o_proj's quant method
+        # at model init, so it survives compile cache hits.
+        self._block_fp8_op = None  # W8A8BlockFp8LinearOp | None
+        self.o_proj_weight = None  # for deepgemm dispatch check
 
     @property
     def chunked_prefill_workspace_size(self) -> int:
@@ -543,8 +592,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        use_quant = output_scale is not None or output_block_scale is not None
-        if use_quant:
+        assert output is not None, "Output tensor must be provided."
+
+        quant_key = _detect_output_quant_key(
+            output, output_scale, output_block_scale, self.num_heads * self.v_head_dim
+        )
+        if quant_key is not None:
             # The fusion pass has allocated output with quantized dtype
             # (FP8 or uint8 for FP4). We can't write into it directly,
             # so we swap in a temp buffer for computation, then quantize
@@ -575,7 +628,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # The zero fill is required when used with DP + EP
             # to ensure all ranks within a DP group compute the
             # same expert outputs.
-            if use_quant:
+            if quant_key is not None:
                 return quant_output.fill_(0)
             return output.fill_(0)
 
@@ -717,18 +770,44 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
 
-        if use_quant:
+        if quant_key is not None:
             # Quantize the BF16 computation result into the quantized output
             actual = output[:num_actual_toks]
-            if output_block_scale is not None:
+            if quant_key == kNvfp4Dynamic:
                 # NVFP4: two FP4 values packed into one uint8
+                assert output_block_scale is not None
                 fp4_data, fp4_scales = ops.scaled_fp4_quant(actual, output_scale)
                 quant_output[:num_actual_toks].copy_(fp4_data)
-                output_block_scale.copy_(fp4_scales)
-            else:
+                output_block_scale[: fp4_scales.shape[0]].copy_(fp4_scales)
+            elif quant_key in (kFp8Dynamic128Sym, kFp8Dynamic64Sym):
+                # Per-group FP8
+                assert output_block_scale is not None
+                assert self._block_fp8_op is not None, (
+                    "Group FP8 output quant requested but "
+                    "quant_config has no weight_block_size"
+                )
+                # Pick deepgemm or fallback quant op — same dispatch
+                # as W8A8BlockFp8LinearOp.apply() for o_proj.
+                if (
+                    self._block_fp8_op.deepgemm_input_quant_op is not None
+                    and should_use_deepgemm_for_fp8_linear(
+                        actual.dtype,
+                        self.o_proj_weight,
+                        self._block_fp8_op.is_deep_gemm_supported,
+                    )
+                ):
+                    quant_op = self._block_fp8_op.deepgemm_input_quant_op
+                else:
+                    quant_op = self._block_fp8_op.input_quant_op
+                fp8_data, fp8_scales = quant_op(actual)
+                quant_output[:num_actual_toks].copy_(fp8_data)
+                output_block_scale[:num_actual_toks].copy_(fp8_scales)
+            elif quant_key == kFp8StaticTensorSym:
                 # Static FP8 quantization
                 fp8_data, _ = self._quant_fp8_op(actual, output_scale)
                 quant_output[:num_actual_toks].copy_(fp8_data)
+            else:
+                raise ValueError(f"Unsupported quant_key: {quant_key}")
             return quant_output
 
         return output_padded
@@ -2071,12 +2150,12 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
     """
 
     def fused_output_quant_supported(self, quant_key):
-        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        return quant_key in (
             kFp8StaticTensorSym,
             kNvfp4Dynamic,
+            kFp8Dynamic128Sym,
+            kFp8Dynamic64Sym,
         )
-
-        return quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
 
     def __init__(
         self,
