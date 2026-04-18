@@ -36,6 +36,7 @@ from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
+    create_fp8_quant_key,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
@@ -285,22 +286,25 @@ class TestMLAAttentionFp8GroupQuantPatternModel(MLAAttentionQuantPatternModel):
     """Test model for MLA Attention + per-group FP8 (block quant) fusion."""
 
     quant_key = kFp8Dynamic128Sym
-    quant_config = Fp8Config()
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=[128, 128],
+    )
 
     def __init__(self, *args, **kwargs):
-        from tests.utils import TestBlockFP8Layer
-
         super().__init__(*args, **kwargs)
 
-        self.block_fp8_linear = TestBlockFP8Layer(
+        weight_quant_key = create_fp8_quant_key(
+            static=True, group_shape=GroupShape(128, 128)
+        )
+        device = kwargs.get("device", torch.device("cuda:0"))
+
+        self.block_fp8_linear = TestFP8Layer(
             weight_shape=(self.output_dim, self.output_dim),
-            group_shape=GroupShape(1, 128),
-        )
-        self.block_fp8_linear.weight = self.block_fp8_linear.weight.to(
-            kwargs.get("device", torch.device("cuda:0"))
-        )
-        self.block_fp8_linear.weight_scale = self.block_fp8_linear.weight_scale.to(
-            kwargs.get("device", torch.device("cuda:0"))
+            activation_quant_key=self.quant_key,
+            weight_quant_key=weight_quant_key,
+            input_dtype=self.dtype,
+            device=device,
         )
 
         w = kwargs.get("w")
@@ -310,13 +314,9 @@ class TestMLAAttentionFp8GroupQuantPatternModel(MLAAttentionQuantPatternModel):
 
         self.w = {
             "weight": self.block_fp8_linear.weight,
-            "wscale": self.block_fp8_linear.weight_scale,
+            "wscale": getattr(self.block_fp8_linear, "weight_scale", None)
+            or getattr(self.block_fp8_linear, "weight_scale_inv", None),
         }
-
-        # Set block FP8 op on mla_attn (normally done by
-        # MultiHeadLatentAttentionWrapper from o_proj).
-        self.mla_attn._block_fp8_op = self.block_fp8_linear.linear_op
-        self.mla_attn.o_proj_weight = self.block_fp8_linear.weight
 
     def forward(
         self,

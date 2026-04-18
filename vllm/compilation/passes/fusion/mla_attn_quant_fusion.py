@@ -237,8 +237,14 @@ class MLAAttnNvfp4QuantPattern(
             return _pattern_with_ln
 
         def _pattern(
-            q, kv_c_normed, k_pe, output_attn, output_quant, output_scale,
-            input_scale, kv_cache_dummy_dep,
+            q,
+            kv_c_normed,
+            k_pe,
+            output_attn,
+            output_quant,
+            output_scale,
+            input_scale,
+            kv_cache_dummy_dep,
         ):
             at1 = auto_functionalized(
                 MLA_ATTN_OP,
@@ -306,8 +312,14 @@ class MLAAttnNvfp4QuantPattern(
             return _replacement_with_ln
 
         def _replacement(
-            q, kv_c_normed, k_pe, output_attn, _output_quant, output_scale,
-            input_scale, kv_cache_dummy_dep,
+            q,
+            kv_c_normed,
+            k_pe,
+            output_attn,
+            _output_quant,
+            output_scale,
+            input_scale,
+            kv_cache_dummy_dep,
         ):
             # MLA output in quant_dtype (FP4 packed as uint8)
             output_attn = torch.empty(
@@ -441,14 +453,8 @@ class MLAAttnFp8GroupQuantPattern(
 
         if _USE_LAYERNAME:
 
-            def _pattern_with_ln(  # type: ignore[misc]
-                q,
-                kv_c_normed,
-                k_pe,
-                output_attn,
-                input_scale,
-                kv_cache_dummy_dep,
-                layer_name,
+            def _replacement_with_ln(
+                q, kv_c_normed, k_pe, output_attn, kv_cache_dummy_dep, scale, layer_name
             ):
                 # MLA output in FP8
                 output_attn = torch.empty(
@@ -456,23 +462,22 @@ class MLAAttnFp8GroupQuantPattern(
                     dtype=FP8_DTYPE,
                     device=q.device,
                 )
-                # Reuse the matched pattern's scale buffer directly.
-                # This preserves whatever strides the original allocation
-                # had (including TMA-aligned strides if applicable).
                 at1 = auto_functionalized(
                     MLA_ATTN_OP,
                     q=q,
                     kv_c_normed=kv_c_normed,
                     k_pe=k_pe,
                     output=output_attn,
-                    layer_name=layer_name,
+                    layer_name=_ln,
                     output_scale=None,
                     output_block_scale=scale,
                     kv_cache_dummy_dep=kv_cache_dummy_dep,
+                    quant_group_size=self._group_size,
+                    quant_scale_ue8m0=self._is_e8m0,
+                    quant_col_major=self._has_col_major_scales,
+                    quant_tma_aligned=self._is_tma_aligned,
                 )
                 return at1[1], at1[2]
-
-            return _pattern_with_ln
 
         def _replacement(q, kv_c_normed, k_pe, output_attn, kv_cache_dummy_dep, scale):
             # MLA output in FP8
@@ -481,9 +486,6 @@ class MLAAttnFp8GroupQuantPattern(
                 dtype=FP8_DTYPE,
                 device=q.device,
             )
-            # Reuse the matched pattern's scale buffer directly.
-            # This preserves whatever strides the original allocation
-            # had (including TMA-aligned strides if applicable).
             at1 = auto_functionalized(
                 MLA_ATTN_OP,
                 q=q,
@@ -494,6 +496,10 @@ class MLAAttnFp8GroupQuantPattern(
                 output_scale=None,
                 output_block_scale=scale,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
+                quant_group_size=self._group_size,
+                quant_scale_ue8m0=self._is_e8m0,
+                quant_col_major=self._has_col_major_scales,
+                quant_tma_aligned=self._is_tma_aligned,
             )
             return at1[1], at1[2]
 

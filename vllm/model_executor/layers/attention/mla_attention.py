@@ -242,7 +242,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import should_use_deepgemm_for_fp8_linear
 from vllm.utils.flashinfer import has_flashinfer, has_nvidia_artifactory
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.torch_utils import (
@@ -501,11 +500,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             group_shape=GroupShape.PER_TENSOR,
             compile_native=True,
         )
-        # Per-group FP8 quant op for fused MLA attention output quantization.
-        # Set by MultiHeadLatentAttentionWrapper from o_proj's quant method
-        # at model init, so it survives compile cache hits.
-        self._block_fp8_op = None  # W8A8BlockFp8LinearOp | None
-        self.o_proj_weight = None  # for deepgemm dispatch check
 
     @property
     def chunked_prefill_workspace_size(self) -> int:
@@ -591,6 +585,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        quant_kwargs: dict | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
@@ -782,26 +777,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             elif quant_key in (kFp8Dynamic128Sym, kFp8Dynamic64Sym):
                 # Per-group FP8
                 assert output_block_scale is not None
-                assert self._block_fp8_op is not None, (
+                assert quant_kwargs is not None, (
                     "Group FP8 output quant requested but "
-                    "quant_config has no weight_block_size"
+                    "quant_kwargs not passed through custom op"
                 )
-                # Pick deepgemm or fallback quant op — same dispatch
-                # as W8A8BlockFp8LinearOp.apply() for o_proj.
-                if (
-                    self._block_fp8_op.deepgemm_input_quant_op is not None
-                    and should_use_deepgemm_for_fp8_linear(
-                        actual.dtype,
-                        self.o_proj_weight,
-                        self._block_fp8_op.is_deep_gemm_supported,
-                    )
-                ):
-                    quant_op = self._block_fp8_op.deepgemm_input_quant_op
-                else:
-                    quant_op = self._block_fp8_op.input_quant_op
-                fp8_data, fp8_scales = quant_op(actual)
-                quant_output[:num_actual_toks].copy_(fp8_data)
-                output_block_scale[:num_actual_toks].copy_(fp8_scales)
+                finfo = torch.finfo(_FP8_DTYPE)
+                torch.ops._C.per_token_group_fp8_quant(
+                    actual,
+                    quant_output[:num_actual_toks],
+                    output_block_scale[:num_actual_toks],
+                    quant_kwargs["group_size"],
+                    1e-10,  # eps
+                    finfo.min,
+                    finfo.max,
+                    quant_kwargs["scale_ue8m0"],
+                    quant_kwargs["col_major_scales"],
+                    quant_kwargs["tma_aligned"],
+                )
             elif quant_key == kFp8StaticTensorSym:
                 # Static FP8 quantization
                 fp8_data, _ = self._quant_fp8_op(actual, output_scale)
@@ -1052,6 +1044,10 @@ def unified_mla_attention_with_output(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
+    quant_group_size: int = 0,
+    quant_scale_ue8m0: bool = False,
+    quant_col_major: bool = False,
+    quant_tma_aligned: bool = False,
 ) -> None:
     # kv_cache_dummy_dep is not used but accepting it creates a data dependency
     # that ensures torch.compile preserves ordering between KV cache update and
@@ -1059,6 +1055,14 @@ def unified_mla_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, layer, kv_cache, _ = get_attention_context(layer_name)
+    quant_kwargs = None
+    if quant_group_size > 0:
+        quant_kwargs = {
+            "group_size": quant_group_size,
+            "scale_ue8m0": quant_scale_ue8m0,
+            "col_major_scales": quant_col_major,
+            "tma_aligned": quant_tma_aligned,
+        }
     layer.forward_impl(
         q,
         kv_c_normed,
@@ -1068,6 +1072,7 @@ def unified_mla_attention_with_output(
         output=output,
         output_scale=output_scale,
         output_block_scale=output_block_scale,
+        quant_kwargs=quant_kwargs,
     )
 
 
@@ -1080,6 +1085,10 @@ def unified_mla_attention_with_output_fake(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
+    quant_group_size: int = 0,
+    quant_scale_ue8m0: bool = False,
+    quant_col_major: bool = False,
+    quant_tma_aligned: bool = False,
 ) -> None:
     return
 
