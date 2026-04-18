@@ -306,6 +306,7 @@ class TestMLAAttentionFp8GroupQuantPatternModel(MLAAttentionQuantPatternModel):
             input_dtype=self.dtype,
             device=device,
         )
+        self.block_fp8_linear.weight_block_size = [128, 128]
 
         w = kwargs.get("w")
         if w is not None:

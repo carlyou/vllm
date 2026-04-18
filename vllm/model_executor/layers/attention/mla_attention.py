@@ -1044,10 +1044,10 @@ def unified_mla_attention_with_output(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
-    quant_group_size: int = 0,
-    quant_scale_ue8m0: bool = False,
-    quant_col_major: bool = False,
-    quant_tma_aligned: bool = False,
+    quant_group_size: int | None = None,
+    quant_scale_ue8m0: bool | None = None,
+    quant_col_major: bool | None = None,
+    quant_tma_aligned: bool | None = None,
 ) -> None:
     # kv_cache_dummy_dep is not used but accepting it creates a data dependency
     # that ensures torch.compile preserves ordering between KV cache update and
@@ -1056,7 +1056,7 @@ def unified_mla_attention_with_output(
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, layer, kv_cache, _ = get_attention_context(layer_name)
     quant_kwargs = None
-    if quant_group_size > 0:
+    if quant_group_size is not None:
         quant_kwargs = {
             "group_size": quant_group_size,
             "scale_ue8m0": quant_scale_ue8m0,
@@ -1085,10 +1085,10 @@ def unified_mla_attention_with_output_fake(
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
-    quant_group_size: int = 0,
-    quant_scale_ue8m0: bool = False,
-    quant_col_major: bool = False,
-    quant_tma_aligned: bool = False,
+    quant_group_size: int | None = None,
+    quant_scale_ue8m0: bool | None = None,
+    quant_col_major: bool | None = None,
+    quant_tma_aligned: bool | None = None,
 ) -> None:
     return
 
