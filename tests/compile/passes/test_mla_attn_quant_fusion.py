@@ -299,14 +299,19 @@ class TestMLAAttentionFp8GroupQuantPatternModel(MLAAttentionQuantPatternModel):
         )
         device = kwargs.get("device", torch.device("cuda:0"))
 
-        self.block_fp8_linear = TestFP8Layer(
+        # Subclass to set weight_block_size before process_weights_after_loading
+        class _BlockFP8Layer(TestFP8Layer):
+            def __init__(self, *a, **kw):
+                self.weight_block_size = [128, 128]
+                super().__init__(*a, **kw)
+
+        self.block_fp8_linear = _BlockFP8Layer(
             weight_shape=(self.output_dim, self.output_dim),
             activation_quant_key=self.quant_key,
             weight_quant_key=weight_quant_key,
             input_dtype=self.dtype,
             device=device,
         )
-        self.block_fp8_linear.weight_block_size = [128, 128]
 
         w = kwargs.get("w")
         if w is not None:

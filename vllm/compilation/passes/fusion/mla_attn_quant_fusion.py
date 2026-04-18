@@ -479,6 +479,8 @@ class MLAAttnFp8GroupQuantPattern(
                 )
                 return at1[1], at1[2]
 
+            return _replacement_with_ln
+
         def _replacement(q, kv_c_normed, k_pe, output_attn, kv_cache_dummy_dep, scale):
             # MLA output in FP8
             output_attn = torch.empty(
