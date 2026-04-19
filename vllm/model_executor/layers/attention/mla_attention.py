@@ -669,7 +669,25 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
+        # Prefill path can write the quantized output directly when the
+        # detected quant_key is static FP8 and the impl's prefill kernel can
+        # emit that format for this metadata. Decode portion still goes through
+        # the BF16 temp + post-kernel quant.
+        fp8_prefill_fast_path = (
+            quant_key is kFp8StaticTensorSym
+            and num_mha_tokens > 0
+            and self.impl.support_prefill_quantized_output(
+                kFp8StaticTensorSym, attn_metadata.prefill
+            )
+        )
+
         if num_mha_tokens > 0:
+            if fp8_prefill_fast_path:
+                mha_output = quant_output[num_mqa_tokens:num_actual_toks]
+                mha_output_scale = output_scale
+            else:
+                mha_output = output[num_mqa_tokens:]
+                mha_output_scale = None
             self.impl.forward_mha(  # type: ignore[attr-defined]
                 q[num_mqa_tokens:],
                 k_c_normed[num_mqa_tokens:],
@@ -677,7 +695,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 kv_cache,
                 attn_metadata,
                 self._k_scale,
-                output=output[num_mqa_tokens:],
+                output=mha_output,
+                output_scale=mha_output_scale,
             )
 
         if num_mqa_tokens > 0:
@@ -776,40 +795,45 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self._v_up_proj(attn_out, out=mqa_output_slice)
 
         if quant_key is not None:
-            # Quantize the BF16 computation result into the quantized output
-            actual = output[:num_actual_toks]
-            if quant_key == kNvfp4Dynamic:
-                # NVFP4: two FP4 values packed into one uint8
-                assert output_block_scale is not None
-                fp4_data, fp4_scales = ops.scaled_fp4_quant(actual, output_scale)
-                quant_output[:num_actual_toks].copy_(fp4_data)
-                output_block_scale[: fp4_scales.shape[0]].copy_(fp4_scales)
-            elif quant_key in (kFp8Dynamic128Sym, kFp8Dynamic64Sym):
-                # Per-group FP8
-                assert output_block_scale is not None
-                assert quant_group_size is not None, (
-                    "Group FP8 output quant requested but "
-                    "quant_group_size not passed through custom op"
-                )
-                finfo = torch.finfo(_FP8_DTYPE)
-                torch.ops._C.per_token_group_fp8_quant(
-                    actual,
-                    quant_output[:num_actual_toks],
-                    output_block_scale[:num_actual_toks],
-                    quant_group_size,
-                    1e-10,  # eps
-                    finfo.min,
-                    finfo.max,
-                    quant_scale_ue8m0,
-                    quant_col_major,
-                    quant_tma_aligned,
-                )
-            elif quant_key == kFp8StaticTensorSym:
-                # Static FP8 quantization
-                fp8_data, _ = self._quant_fp8_op(actual, output_scale)
-                quant_output[:num_actual_toks].copy_(fp8_data)
-            else:
-                raise ValueError(f"Unsupported quant_key: {quant_key}")
+            # Quantize the BF16 computation result into the quantized output.
+            # When the static-FP8 prefill fast path fired, the prefill slice is
+            # already written into quant_output; only quantize the decode (MQA)
+            # slice.
+            quant_end = num_mqa_tokens if fp8_prefill_fast_path else num_actual_toks
+            if quant_end > 0:
+                actual = output[:quant_end]
+                if quant_key == kNvfp4Dynamic:
+                    # NVFP4: two FP4 values packed into one uint8
+                    assert output_block_scale is not None
+                    fp4_data, fp4_scales = ops.scaled_fp4_quant(actual, output_scale)
+                    quant_output[:quant_end].copy_(fp4_data)
+                    output_block_scale[: fp4_scales.shape[0]].copy_(fp4_scales)
+                elif quant_key in (kFp8Dynamic128Sym, kFp8Dynamic64Sym):
+                    # Per-group FP8
+                    assert output_block_scale is not None
+                    assert quant_group_size is not None, (
+                        "Group FP8 output quant requested but "
+                        "quant_group_size not passed through custom op"
+                    )
+                    finfo = torch.finfo(_FP8_DTYPE)
+                    torch.ops._C.per_token_group_fp8_quant(
+                        actual,
+                        quant_output[:quant_end],
+                        output_block_scale[:quant_end],
+                        quant_group_size,
+                        1e-10,  # eps
+                        finfo.min,
+                        finfo.max,
+                        quant_scale_ue8m0,
+                        quant_col_major,
+                        quant_tma_aligned,
+                    )
+                elif quant_key == kFp8StaticTensorSym:
+                    # Static FP8 quantization
+                    fp8_data, _ = self._quant_fp8_op(actual, output_scale)
+                    quant_output[:quant_end].copy_(fp8_data)
+                else:
+                    raise ValueError(f"Unsupported quant_key: {quant_key}")
             return quant_output
 
         return output_padded
@@ -2171,6 +2195,22 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             kFp8Dynamic64Sym,
         )
 
+    def support_prefill_quantized_output(self, quant_key, prefill_metadata):
+        """Whether the new-tokens prefill kernel can write quantized output
+        directly for ``quant_key`` and the given prefill metadata. Chunked
+        context still goes through the BF16 path because ``merge_attn_states``
+        needs BF16 partials to keep reduction precision. Only static per-tensor
+        FP8 on the trtllm-ragged backend is wired today.
+        """
+        if prefill_metadata is None or prefill_metadata.chunked_context is not None:
+            return False
+
+        return (
+            quant_key == kFp8StaticTensorSym
+            and self._run_prefill_new_tokens
+            == self._run_prefill_new_tokens_trtllm_ragged
+        )
+
     def __init__(
         self,
         num_heads: int,
@@ -2325,7 +2365,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         return attn_out
 
     def _run_prefill_new_tokens_fa(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        output_scale: torch.Tensor | None = None,
     ):
         return self._flash_attn_varlen_diff_headdims(
             q=q,
@@ -2341,7 +2387,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
     def _run_prefill_new_tokens_fi(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        output_scale: torch.Tensor | None = None,
     ):
         assert isinstance(prefill, FlashInferPrefillMetadata)
         assert prefill.prefill_main is not None
@@ -2358,7 +2410,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         return ret
 
     def _run_prefill_new_tokens_cudnn(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        output_scale: torch.Tensor | None = None,
     ):
         assert isinstance(prefill, CudnnPrefillMetadata)
         assert prefill.query_seq_lens is not None
@@ -2444,20 +2502,38 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
     def _run_prefill_new_tokens_trtllm_ragged(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        output_scale: torch.Tensor | None = None,
     ):
-        """TRT-LLM ragged attention for new tokens (causal)."""
+        """TRT-LLM ragged attention for new tokens (causal).
+
+        When ``output_scale`` is provided the kernel writes FP8 directly,
+        folding ``1 / output_scale`` into ``bmm2_scale`` to match vLLM's
+        post-kernel ``_quant_fp8_op`` convention.
+        """
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
         assert prefill.query_seq_lens is not None
         assert prefill.workspace_buffer is not None
-        # allocate BF16 / FP16 output tensor for TRT-LLM ragged attention
+
+        if output_scale is not None:
+            out_dtype = current_platform.fp8_dtype()
+            bmm2_scale = 1.0 / output_scale.item()
+        else:
+            out_dtype = prefill.output_dtype
+            bmm2_scale = 1.0
+
         out = torch.empty(
             q.shape[0],
             q.shape[1],
             v.shape[2],
             device=q.device,
-            dtype=prefill.output_dtype,
+            dtype=out_dtype,
         )
 
         ret = trtllm_ragged_attention_deepseek(
@@ -2469,7 +2545,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             max_q_len=prefill.max_query_len,
             max_kv_len=prefill.max_query_len,
             bmm1_scale=self.scale,
-            bmm2_scale=1.0,
+            bmm2_scale=bmm2_scale,
             o_sf_scale=1.0,
             batch_size=prefill.query_seq_lens.shape[0],
             window_left=-1,
@@ -2775,6 +2851,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         attn_metadata: MLACommonMetadata,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
     ) -> None:
         # TODO (zyongye): Prefill function here
         assert attn_metadata.prefill is not None
@@ -2799,13 +2876,25 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             k = k.to(prefill_metadata.q_data_type)
             v = v.to(prefill_metadata.q_data_type)
 
-        output_prefill = self._run_prefill_new_tokens(
-            prefill=prefill_metadata,
-            q=q,
-            k=k,
-            v=v,
-            return_softmax_lse=has_context,
-        )
+        # Caller (forward_impl) only passes ``output_scale`` when the in-kernel
+        # FP8 output path is safe (trtllm-ragged backend, no chunked context).
+        if output_scale is not None:
+            output_prefill = self._run_prefill_new_tokens_trtllm_ragged(
+                prefill=prefill_metadata,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=False,
+                output_scale=output_scale,
+            )
+        else:
+            output_prefill = self._run_prefill_new_tokens(
+                prefill=prefill_metadata,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=has_context,
+            )
 
         if has_context:
             assert prefill_metadata.chunked_context is not None
