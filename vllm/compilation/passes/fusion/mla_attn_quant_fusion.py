@@ -404,6 +404,52 @@ class MLAAttnFp8GroupQuantPattern(
     def pattern(
         self,
     ) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+        _ln = _encode_layer_name(self._layer_name)
+
+        if _USE_LAYERNAME:
+
+            def _pattern_with_ln(  # type: ignore[misc]
+                q,
+                kv_c_normed,
+                k_pe,
+                output_attn,
+                kv_cache_dummy_dep,
+                scale,
+                layer_name,
+            ):
+                at1 = auto_functionalized(
+                    MLA_ATTN_OP,
+                    q=q,
+                    kv_c_normed=kv_c_normed,
+                    k_pe=k_pe,
+                    output=output_attn,
+                    layer_name=layer_name,
+                    output_scale=None,
+                    output_block_scale=None,
+                    kv_cache_dummy_dep=kv_cache_dummy_dep,
+                )
+                attn_out = at1[1]
+                result = torch.empty(
+                    attn_out.shape, device=attn_out.device, dtype=FP8_DTYPE
+                )
+                finfo = torch.finfo(FP8_DTYPE)
+                _, result, scale = auto_functionalized(
+                    self._quant_matcher.QUANT_OP,
+                    input=attn_out,
+                    output_q=result,
+                    output_s=scale,
+                    group_size=self._group_size,
+                    eps=1e-10,
+                    fp8_min=finfo.min,
+                    fp8_max=finfo.max,
+                    scale_ue8m0=self._is_e8m0,
+                    dummy_is_scale_transposed=self._has_col_major_scales,
+                    dummy_is_tma_aligned=self._is_tma_aligned,
+                )
+                return result, scale
+
+            return _pattern_with_ln
+
         def _pattern(
             q: torch.Tensor,
             kv_c_normed: torch.Tensor,
@@ -418,7 +464,7 @@ class MLAAttnFp8GroupQuantPattern(
                 kv_c_normed=kv_c_normed,
                 k_pe=k_pe,
                 output=output_attn,
-                layer_name=self._layer_name,
+                layer_name=_ln,
                 output_scale=None,
                 output_block_scale=None,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
@@ -453,10 +499,15 @@ class MLAAttnFp8GroupQuantPattern(
 
         if _USE_LAYERNAME:
 
-            def _replacement_with_ln(
-                q, kv_c_normed, k_pe, output_attn, kv_cache_dummy_dep, scale, layer_name
+            def _replacement_with_ln(  # type: ignore[misc]
+                q,
+                kv_c_normed,
+                k_pe,
+                output_attn,
+                kv_cache_dummy_dep,
+                scale,
+                layer_name,
             ):
-                # MLA output in FP8
                 output_attn = torch.empty(
                     [q.shape[0], self._output_dim],
                     dtype=FP8_DTYPE,
@@ -468,7 +519,7 @@ class MLAAttnFp8GroupQuantPattern(
                     kv_c_normed=kv_c_normed,
                     k_pe=k_pe,
                     output=output_attn,
-                    layer_name=_ln,
+                    layer_name=layer_name,
                     output_scale=None,
                     output_block_scale=scale,
                     kv_cache_dummy_dep=kv_cache_dummy_dep,
@@ -482,7 +533,6 @@ class MLAAttnFp8GroupQuantPattern(
             return _replacement_with_ln
 
         def _replacement(q, kv_c_normed, k_pe, output_attn, kv_cache_dummy_dep, scale):
-            # MLA output in FP8
             output_attn = torch.empty(
                 [q.shape[0], self._output_dim],
                 dtype=FP8_DTYPE,
@@ -577,5 +627,7 @@ class MLAAttnQuantFusionPass(VllmFusionPatternMatcherPass):
                                             tma_aligned,
                                         )
                                     )
+                                    if _USE_LAYERNAME:
+                                        break
 
         self.dump_patterns(config, self.pm_pass)

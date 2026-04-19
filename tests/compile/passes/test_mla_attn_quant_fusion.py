@@ -29,6 +29,9 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+    CutlassFp8BlockScaledMMKernel,
+)
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -305,23 +308,26 @@ class TestMLAAttentionFp8GroupQuantPatternModel(MLAAttentionQuantPatternModel):
                 self.weight_block_size = [128, 128]
                 super().__init__(*a, **kw)
 
+        # Force CutlassFp8BlockScaledMMKernel to ensure the graph uses
+        # per_token_group_fp8_quant (not the deepgemm packed variant).
         self.block_fp8_linear = _BlockFP8Layer(
             weight_shape=(self.output_dim, self.output_dim),
             activation_quant_key=self.quant_key,
             weight_quant_key=weight_quant_key,
             input_dtype=self.dtype,
             device=device,
+            force_kernel=CutlassFp8BlockScaledMMKernel,
         )
 
         w = kwargs.get("w")
         if w is not None:
             self.block_fp8_linear.weight = w["weight"]
-            self.block_fp8_linear.weight_scale = w["wscale"]
+            # Block-wise uses weight_scale_inv, not weight_scale
+            self.block_fp8_linear.weight_scale_inv = w["wscale"]
 
         self.w = {
             "weight": self.block_fp8_linear.weight,
-            "wscale": getattr(self.block_fp8_linear, "weight_scale", None)
-            or getattr(self.block_fp8_linear, "weight_scale_inv", None),
+            "wscale": self.block_fp8_linear.weight_scale_inv,
         }
 
     def forward(
