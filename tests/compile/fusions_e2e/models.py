@@ -175,8 +175,8 @@ deepseek_v32_fp8 = ModelFusionInfo(
         rms_quant_fusion=min(3, n_layers),
         # silu+quant on dense layers only; MoE hides the act+quant site
         act_quant_fusion=min(3, n_layers),
-        # MLA attn + quant fusion pattern doesn't match the sparse MLA output path
-        attn_quant_fusion=0,
+        # MLA attn + per-group FP8 quant fuses on sparse MLA output path too
+        attn_quant_fusion=n_layers,
         ar_rms_fusion=n_layers * 2 + 1,
     ),
 )
