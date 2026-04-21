@@ -27,6 +27,7 @@ from .models import (
     deepseek_r1_fp4,
     deepseek_v3_fp8,
     deepseek_v32_fp4,
+    deepseek_v32_fp8,
     llama3_8b_fp4,
     llama3_8b_fp8,
     llama4_scout_fp4,
@@ -44,6 +45,7 @@ from .models import (
         (*deepseek_coder_v2_lite_fp8, False),
         (*deepseek_v3_fp8, False),
         (*deepseek_v3_fp8, True),
+        (*deepseek_v32_fp8, False),
         pytest.param(
             *llama4_scout_fp8,
             False,
@@ -63,6 +65,7 @@ from .models import (
         ROCM_AITER_UNIFIED_ATTN,
         FLASHINFER_MLA_ATTN,
         TRITON_MLA_ATTN,
+        FLASHMLA_SPARSE_ATTN,
     ],
 )
 @pytest.mark.parametrize("n_layers", [6])

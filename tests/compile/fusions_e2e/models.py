@@ -65,8 +65,11 @@ FLASHMLA_SPARSE_ATTN = pytest.param(
     ),
     id="FLASHMLA_SPARSE",
     marks=pytest.mark.skipif(
-        not is_blackwell(),
-        reason="FlashMLA Sparse requires Blackwell",
+        not (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability().major in (9, 10)
+        ),
+        reason="FlashMLA Sparse requires Hopper or Blackwell",
     ),
 )
 
@@ -160,6 +163,17 @@ deepseek_coder_v2_lite_fp8 = ModelFusionInfo(
         rms_quant_fusion=1,
         act_quant_fusion=min(1, n_layers),  # dense layers only
         # MLA attn + static FP8 quant
+        attn_quant_fusion=n_layers,
+        ar_rms_fusion=n_layers * 2 + 1,
+    ),
+)
+
+deepseek_v32_fp8 = ModelFusionInfo(
+    model_name="deepseek-ai/DeepSeek-V3.2-Exp",
+    matches=lambda n_layers: Matches(
+        # Matches likely to shift for sparse MLA; tune after first green run.
+        rms_quant_fusion=0,
+        act_quant_fusion=0,
         attn_quant_fusion=n_layers,
         ar_rms_fusion=n_layers * 2 + 1,
     ),
