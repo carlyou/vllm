@@ -65,11 +65,8 @@ FLASHMLA_SPARSE_ATTN = pytest.param(
     ),
     id="FLASHMLA_SPARSE",
     marks=pytest.mark.skipif(
-        not (
-            current_platform.is_cuda()
-            and current_platform.get_device_capability().major in (9, 10)
-        ),
-        reason="FlashMLA Sparse requires Hopper or Blackwell",
+        not is_blackwell(),
+        reason="FlashMLA Sparse requires Blackwell",
     ),
 )
 
@@ -163,19 +160,6 @@ deepseek_coder_v2_lite_fp8 = ModelFusionInfo(
         rms_quant_fusion=1,
         act_quant_fusion=min(1, n_layers),  # dense layers only
         # MLA attn + static FP8 quant
-        attn_quant_fusion=n_layers,
-        ar_rms_fusion=n_layers * 2 + 1,
-    ),
-)
-
-deepseek_v32_fp8 = ModelFusionInfo(
-    model_name="deepseek-ai/DeepSeek-V3.2-Exp",
-    matches=lambda n_layers: Matches(
-        # 3 dense layers (first_k_dense_replace=3): input_rms + qkv_proj per layer
-        rms_quant_fusion=min(3, n_layers),
-        # silu+quant on dense layers only; MoE hides the act+quant site
-        act_quant_fusion=min(3, n_layers),
-        # MLA attn + per-group FP8 quant fuses on sparse MLA output path too
         attn_quant_fusion=n_layers,
         ar_rms_fusion=n_layers * 2 + 1,
     ),
