@@ -585,7 +585,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
-        quant_kwargs: dict | None = None,
+        quant_group_size: int | None = None,
+        quant_scale_ue8m0: bool | None = None,
+        quant_col_major: bool | None = None,
+        quant_tma_aligned: bool | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
@@ -777,22 +780,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             elif quant_key in (kFp8Dynamic128Sym, kFp8Dynamic64Sym):
                 # Per-group FP8
                 assert output_block_scale is not None
-                assert quant_kwargs is not None, (
+                assert quant_group_size is not None, (
                     "Group FP8 output quant requested but "
-                    "quant_kwargs not passed through custom op"
+                    "quant_group_size not passed through custom op"
                 )
                 finfo = torch.finfo(_FP8_DTYPE)
                 torch.ops._C.per_token_group_fp8_quant(
                     actual,
                     quant_output[:num_actual_toks],
                     output_block_scale[:num_actual_toks],
-                    quant_kwargs["group_size"],
+                    quant_group_size,
                     1e-10,  # eps
                     finfo.min,
                     finfo.max,
-                    quant_kwargs["scale_ue8m0"],
-                    quant_kwargs["col_major_scales"],
-                    quant_kwargs["tma_aligned"],
+                    quant_scale_ue8m0,
+                    quant_col_major,
+                    quant_tma_aligned,
                 )
             elif quant_key == kFp8StaticTensorSym:
                 # Static FP8 quantization
@@ -1055,14 +1058,6 @@ def unified_mla_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, layer, kv_cache, _ = get_attention_context(layer_name)
-    quant_kwargs = None
-    if quant_group_size is not None:
-        quant_kwargs = {
-            "group_size": quant_group_size,
-            "scale_ue8m0": quant_scale_ue8m0,
-            "col_major_scales": quant_col_major,
-            "tma_aligned": quant_tma_aligned,
-        }
     layer.forward_impl(
         q,
         kv_c_normed,
@@ -1072,7 +1067,10 @@ def unified_mla_attention_with_output(
         output=output,
         output_scale=output_scale,
         output_block_scale=output_block_scale,
-        quant_kwargs=quant_kwargs,
+        quant_group_size=quant_group_size,
+        quant_scale_ue8m0=quant_scale_ue8m0,
+        quant_col_major=quant_col_major,
+        quant_tma_aligned=quant_tma_aligned,
     )
 
 

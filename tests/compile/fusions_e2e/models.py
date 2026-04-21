@@ -192,6 +192,16 @@ deepseek_r1_fp4 = ModelFusionInfo(
     ),
 )
 
+deepseek_v32_fp4 = ModelFusionInfo(
+    model_name="nvidia/DeepSeek-V3.2-NVFP4",
+    matches=lambda n_layers: Matches(
+        rms_quant_fusion=0,
+        act_quant_fusion=0,
+        attn_quant_fusion=n_layers,
+        ar_rms_fusion=n_layers * 2 + 1,
+    ),
+)
+
 gpt_oss_20b = ModelFusionInfo(
     model_name="openai/gpt-oss-20b",
     matches=lambda n_layers: Matches(
