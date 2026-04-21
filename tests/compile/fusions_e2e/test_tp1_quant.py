@@ -184,12 +184,12 @@ def test_tp1_fp4_fusions(
         pass_config=PassConfig(
             fuse_norm_quant=True,
             fuse_act_quant=True,
-            fuse_attn_quant=False,  # DIAG: disable fusion to isolate assert
+            fuse_attn_quant=True,
             enable_qk_norm_rope_fusion=True,
         ),
     )
 
-    matches_check = ["act_quant_fusion", "norm_rope_fusion"]
+    matches_check = ["act_quant_fusion", "attn_quant_fusion", "norm_rope_fusion"]
 
     run_e2e_fusion_test(
         model_name,
