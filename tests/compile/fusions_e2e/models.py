@@ -59,7 +59,10 @@ TRITON_MLA_ATTN = pytest.param(
 )
 
 FLASHMLA_SPARSE_ATTN = pytest.param(
-    AttentionBackendCase(backend=AttentionBackendEnum.FLASHMLA_SPARSE),
+    AttentionBackendCase(
+        backend=AttentionBackendEnum.FLASHMLA_SPARSE,
+        model_kwargs=dict(kv_cache_dtype="fp8_ds_mla"),
+    ),
     id="FLASHMLA_SPARSE",
     marks=pytest.mark.skipif(
         not is_blackwell(),
