@@ -2327,6 +2327,12 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
         )
 
+        # Cached host-side scale for the FP8 prefill fast path. Populated on
+        # the first warmup call so the cudagraph-captured run does not need to
+        # call ``output_scale.item()`` (which forces a GPU->CPU sync and is
+        # disallowed inside a cudagraph).
+        self._prefill_o_scale_float: float | None = None
+
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
     ):
@@ -2372,7 +2378,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         v,
         return_softmax_lse,
         output_scale: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ):
+        assert output_scale is None, "FA MLA prefill does not support FP8 output"
+        assert out is None, "FA MLA prefill does not accept a preallocated out"
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
@@ -2394,7 +2403,12 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         v,
         return_softmax_lse,
         output_scale: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ):
+        assert output_scale is None, (
+            "FlashInfer MLA prefill does not support FP8 output"
+        )
+        assert out is None, "FlashInfer MLA prefill does not accept a preallocated out"
         assert isinstance(prefill, FlashInferPrefillMetadata)
         assert prefill.prefill_main is not None
 
@@ -2417,7 +2431,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         v,
         return_softmax_lse,
         output_scale: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ):
+        assert output_scale is None, "cuDNN MLA prefill does not support FP8 output"
+        assert out is None, "cuDNN MLA prefill does not accept a preallocated out"
         assert isinstance(prefill, CudnnPrefillMetadata)
         assert prefill.query_seq_lens is not None
         from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
@@ -2509,12 +2526,15 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         v,
         return_softmax_lse,
         output_scale: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ):
         """TRT-LLM ragged attention for new tokens (causal).
 
         When ``output_scale`` is provided the kernel writes FP8 directly,
         folding ``1 / output_scale`` into ``bmm2_scale`` to match vLLM's
-        post-kernel ``_quant_fp8_op`` convention.
+        post-kernel ``_quant_fp8_op`` convention. The scale is sampled to a
+        host scalar on the first call (warmup) and cached so the
+        cudagraph-captured run does not perform a GPU->CPU sync.
         """
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
@@ -2523,18 +2543,26 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         if output_scale is not None:
             out_dtype = current_platform.fp8_dtype()
-            bmm2_scale = 1.0 / output_scale.item()
+            if self._prefill_o_scale_float is None:
+                self._prefill_o_scale_float = output_scale.cpu().item()
+            bmm2_scale = 1.0 / self._prefill_o_scale_float
         else:
             out_dtype = prefill.output_dtype
             bmm2_scale = 1.0
 
-        out = torch.empty(
-            q.shape[0],
-            q.shape[1],
-            v.shape[2],
-            device=q.device,
-            dtype=out_dtype,
-        )
+        if out is None:
+            out = torch.empty(
+                q.shape[0],
+                q.shape[1],
+                v.shape[2],
+                device=q.device,
+                dtype=out_dtype,
+            )
+        else:
+            assert out.dtype == out_dtype, (
+                f"Provided out tensor dtype {out.dtype} does not match "
+                f"expected {out_dtype}"
+            )
 
         ret = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2876,25 +2904,31 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             k = k.to(prefill_metadata.q_data_type)
             v = v.to(prefill_metadata.q_data_type)
 
-        # Caller (forward_impl) only passes ``output_scale`` when the in-kernel
-        # FP8 output path is safe (trtllm-ragged backend, no chunked context).
+        # Caller (forward_impl) only passes ``output_scale`` when
+        # ``support_prefill_quantized_output`` returned True for this metadata,
+        # which guarantees the trtllm-ragged backend and no chunked context.
+        # Hand the kernel the caller-provided ``output`` buffer so it can write
+        # FP8 in-place; backends that don't support this assert below.
         if output_scale is not None:
-            output_prefill = self._run_prefill_new_tokens_trtllm_ragged(
-                prefill=prefill_metadata,
-                q=q,
-                k=k,
-                v=v,
-                return_softmax_lse=False,
-                output_scale=output_scale,
-            )
+            assert not has_context
+            new_tokens_out = output.view(-1, self.num_heads, self.v_head_dim)
         else:
-            output_prefill = self._run_prefill_new_tokens(
-                prefill=prefill_metadata,
-                q=q,
-                k=k,
-                v=v,
-                return_softmax_lse=has_context,
-            )
+            new_tokens_out = None
+
+        output_prefill = self._run_prefill_new_tokens(
+            prefill=prefill_metadata,
+            q=q,
+            k=k,
+            v=v,
+            return_softmax_lse=has_context,
+            output_scale=output_scale,
+            out=new_tokens_out,
+        )
+
+        if output_scale is not None:
+            # Kernel wrote the FP8 output directly into ``output``; nothing
+            # else to do (no chunked context to merge, no BF16 copy needed).
+            return
 
         if has_context:
             assert prefill_metadata.chunked_context is not None
