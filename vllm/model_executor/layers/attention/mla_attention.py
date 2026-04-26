@@ -2190,13 +2190,32 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
     def mha_merge_state_fusion_supported(self, quant_key, attn_metadata):
         # DCP keeps the bf16 path until its cross-rank merge is fused.
-        return (
+        supported = (
             quant_key == kFp8StaticTensorSym
             and attn_metadata is not None
             and attn_metadata.prefill is not None
             and attn_metadata.prefill.chunked_context is not None
             and self.dcp_world_size <= 1
         )
+        # BENCH INSTRUMENTATION (do not merge): count gate hits to confirm
+        # the merge-state fusion actually fires under the test workload.
+        cls = MLACommonImpl
+        cls._mha_fusion_calls = getattr(cls, "_mha_fusion_calls", 0) + 1
+        if supported:
+            cls._mha_fusion_hits = getattr(cls, "_mha_fusion_hits", 0) + 1
+            if cls._mha_fusion_hits == 1:
+                print(
+                    f"[MLA_MERGE_FUSION] first hit: call#{cls._mha_fusion_calls}",
+                    flush=True,
+                )
+        if cls._mha_fusion_calls % 1000 == 0:
+            hits = getattr(cls, "_mha_fusion_hits", 0)
+            print(
+                f"[MLA_MERGE_FUSION] calls={cls._mha_fusion_calls} "
+                f"hits={hits} hit_rate={hits / cls._mha_fusion_calls:.3f}",
+                flush=True,
+            )
+        return supported
 
     def __init__(
         self,
