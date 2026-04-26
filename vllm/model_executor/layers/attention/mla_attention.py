@@ -669,20 +669,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_mqa_tokens = attn_metadata.num_decode_tokens
             num_mha_tokens = q.size(0) - num_mqa_tokens
 
-        # Prefill path can write the quantized output directly when the
-        # detected quant_key is static FP8 and the impl's prefill kernel can
-        # emit that format for this metadata. Decode portion still goes through
-        # the BF16 temp + post-kernel quant.
-        fp8_prefill_fast_path = (
-            quant_key is kFp8StaticTensorSym
-            and num_mha_tokens > 0
-            and self.impl.support_prefill_quantized_output(
-                kFp8StaticTensorSym, attn_metadata.prefill
-            )
+        mha_use_kernel_quant = self.impl.mha_kernel_quant_supported(
+            kFp8StaticTensorSym, attn_metadata.prefill
         )
 
         if num_mha_tokens > 0:
-            if fp8_prefill_fast_path:
+            if mha_use_kernel_quant:
                 mha_output = quant_output[num_mqa_tokens:num_actual_toks]
                 mha_output_scale = output_scale
             else:
@@ -799,7 +791,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # When the static-FP8 prefill fast path fired, the prefill slice is
             # already written into quant_output; only quantize the decode (MQA)
             # slice.
-            quant_end = num_mqa_tokens if fp8_prefill_fast_path else num_actual_toks
+            quant_end = num_mqa_tokens if mha_use_kernel_quant else num_actual_toks
             if quant_end > 0:
                 actual = output[:quant_end]
                 if quant_key == kNvfp4Dynamic:
@@ -2195,21 +2187,34 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             kFp8Dynamic64Sym,
         )
 
-    def support_prefill_quantized_output(self, quant_key, prefill_metadata):
-        """Whether the new-tokens prefill kernel can write quantized output
-        directly for ``quant_key`` and the given prefill metadata. Chunked
-        context still goes through the BF16 path because ``merge_attn_states``
-        needs BF16 partials to keep reduction precision. Only static per-tensor
-        FP8 on the trtllm-ragged backend is wired today.
+    def mha_kernel_quant_supported(self, quant_key, prefill_metadata):
         """
+        Whether the new-tokens prefill kernel can write quantized output
+        directly for ``quant_key`` and the given prefill metadata.
+        """
+        # Universal precondition: chunked context still goes through the BF16
+        # path because ``merge_attn_states`` needs BF16 partials to keep
+        # reduction precision.
         if prefill_metadata is None or prefill_metadata.chunked_context is not None:
             return False
 
-        return (
-            quant_key == kFp8StaticTensorSym
-            and self._run_prefill_new_tokens
-            == self._run_prefill_new_tokens_trtllm_ragged
-        )
+        if quant_key == kFp8StaticTensorSym:
+            # Static per-tensor FP8 via trtllm-ragged. flashinfer's wrapper
+            # rejects the (FP8 query + FP8 out) combo, so back off to the
+            # post-quant path when prefill attention itself runs in FP8.
+            return (
+                self._run_prefill_new_tokens
+                == self._run_prefill_new_tokens_trtllm_ragged
+                and prefill_metadata.q_data_type != current_platform.fp8_dtype()
+            )
+        elif (
+            quant_key in (kFp8Dynamic128Sym, kFp8Dynamic64Sym)
+            or quant_key == kNvfp4Dynamic
+        ):
+            # No prefill kernel supports it, Fall back to the post-quant path.
+            return False
+        else:
+            return False
 
     def __init__(
         self,
@@ -2327,10 +2332,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
         )
 
-        # Cached host-side scale for the FP8 prefill fast path. Populated on
-        # the first warmup call so the cudagraph-captured run does not need to
-        # call ``output_scale.item()`` (which forces a GPU->CPU sync and is
-        # disallowed inside a cudagraph).
         self._prefill_o_scale_float: float | None = None
 
     def _flash_attn_varlen_diff_headdims(
@@ -2380,7 +2381,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         output_scale: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
     ):
-        assert output_scale is None, "FA MLA prefill does not support FP8 output"
+        assert output_scale is None, "FA MLA prefill does not support quant output"
         assert out is None, "FA MLA prefill does not accept a preallocated out"
         return self._flash_attn_varlen_diff_headdims(
             q=q,
@@ -2406,7 +2407,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         out: torch.Tensor | None = None,
     ):
         assert output_scale is None, (
-            "FlashInfer MLA prefill does not support FP8 output"
+            "FlashInfer MLA prefill does not support quant output"
         )
         assert out is None, "FlashInfer MLA prefill does not accept a preallocated out"
         assert isinstance(prefill, FlashInferPrefillMetadata)
@@ -2433,7 +2434,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         output_scale: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
     ):
-        assert output_scale is None, "cuDNN MLA prefill does not support FP8 output"
+        assert output_scale is None, "cuDNN MLA prefill does not support quant output"
         assert out is None, "cuDNN MLA prefill does not accept a preallocated out"
         assert isinstance(prefill, CudnnPrefillMetadata)
         assert prefill.query_seq_lens is not None
@@ -2905,7 +2906,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             v = v.to(prefill_metadata.q_data_type)
 
         # Caller (forward_impl) only passes ``output_scale`` when
-        # ``support_prefill_quantized_output`` returned True for this metadata,
+        # ``mha_kernel_quant_supported`` returned True for this metadata,
         # which guarantees the trtllm-ragged backend and no chunked context.
         # Hand the kernel the caller-provided ``output`` buffer so it can write
         # FP8 in-place; backends that don't support this assert below.
