@@ -472,10 +472,15 @@ void merge_attn_states_launcher(
                 ") must be a multiple of quant_group_size (", group_size, ")");
     TORCH_CHECK(group_size % pack_size == 0, "quant_group_size (", group_size,
                 ") must be a multiple of pack_size (", pack_size, ")");
-    // Intra-group warp shuffle requires uniform warps within a block.
-    TORCH_CHECK(((num_heads * threads_per_head) % 32) == 0,
-                "num_heads * (head_size / pack_size) must be a multiple of "
-                "warpSize (32) for group FP8 merge");
+    // Intra-group warp shuffle uses a full-warp mask, so every lane in a
+    // warp must take the same early-return decision. We need the total
+    // launched thread count to be a multiple of warpSize. (num_tokens can
+    // compensate for an odd per-token count.)
+    TORCH_CHECK(
+        (total_threads % 32) == 0,
+        "total_threads (num_tokens * num_heads * head_size / pack_size) must "
+        "be a multiple of warpSize (32) for group FP8 merge; got ",
+        total_threads);
     const torch::Tensor& sf = output_block_scale.value();
     TORCH_CHECK(sf.scalar_type() == at::ScalarType::Float,
                 "output_block_scale must be FP32, got: ", sf.scalar_type());

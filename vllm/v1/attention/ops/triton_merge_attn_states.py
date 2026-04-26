@@ -250,16 +250,26 @@ def merge_attn_states_group_fp8_kernel(
         p_lse = float("-inf") if p_lse == float("inf") else p_lse
         s_lse = float("-inf") if s_lse == float("inf") else s_lse
         max_lse = tl.maximum(p_lse, s_lse)
-        p_lse_n = p_lse - max_lse
-        s_lse_n = s_lse - max_lse
-        p_se = tl.exp(p_lse_n)
-        s_se = tl.exp(s_lse_n)
-        out_se = p_se + s_se
-        if OUTPUT_LSE:
-            out_lse = tl.log(out_se) + max_lse
-            tl.store(output_lse + head_idx * num_tokens + token_idx, out_lse)
-        p_scale = p_se / out_se
-        s_scale = s_se / out_se
+        # All-(-inf) edge case: chunked prefill can produce p_lse=s_lse=-inf
+        # for a token with no prefix hit; the normal path would yield NaN
+        # (-inf - (-inf)). Fall back to emitting prefix_output (expected to
+        # be zeros), matching the CUDA kernel.
+        if max_lse == float("-inf"):
+            if OUTPUT_LSE:
+                tl.store(output_lse + head_idx * num_tokens + token_idx, max_lse)
+            p_scale = 1.0
+            s_scale = 0.0
+        else:
+            p_lse_n = p_lse - max_lse
+            s_lse_n = s_lse - max_lse
+            p_se = tl.exp(p_lse_n)
+            s_se = tl.exp(s_lse_n)
+            out_se = p_se + s_se
+            if OUTPUT_LSE:
+                out_lse = tl.log(out_se) + max_lse
+                tl.store(output_lse + head_idx * num_tokens + token_idx, out_lse)
+            p_scale = p_se / out_se
+            s_scale = s_se / out_se
     else:
         if OUTPUT_LSE:
             s_lse_only = tl.load(suffix_lse + head_idx * num_tokens + token_idx)
